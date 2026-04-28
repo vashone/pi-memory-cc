@@ -1,0 +1,17 @@
+{
+  "name": "@bozong/pi-memory-cc",
+  "version": "0.1.0",
+  "description": "Claude Code-style memory extension for pi-agent — LLM-driven, file-based, four-type taxonomy",
+  "type": "module",
+  "keywords": ["pi-package"],
+  "license": "MIT",
+  "pi": {
+    "extensions": ["./extensions"],
+    "skills": ["./skills"]
+  },
+  "devDependencies": {
+    "@mariozechner/pi-coding-agent": "latest",
+    "@mariozechner/pi-ai": "latest",
+    "typescript": "^5.0.0"
+  }
+}
