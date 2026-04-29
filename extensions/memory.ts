@@ -15,10 +15,12 @@
  *     reference_*.md
  */
 
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import { findCanonicalGitRoot } from "./git.js";
+import { buildMemorySystemPrompt } from "./prompts.js";
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -28,18 +30,44 @@ const MAX_ENTRYPOINT_BYTES = 25_000;
 
 // ─── Memory directory resolution ─────────────────────────────────────────────
 
+const MAX_SLUG_LENGTH = 200;
+
+/**
+ * djb2 hash — matches Claude Code's sessionStoragePortable.ts simpleHash.
+ * Used as a suffix when the sanitized path exceeds MAX_SLUG_LENGTH.
+ */
+function djb2Hash(str: string): string {
+	let hash = 0;
+	for (let i = 0; i < str.length; i++) {
+		hash = ((hash << 5) - hash + str.charCodeAt(i)) | 0;
+	}
+	return Math.abs(hash).toString(36);
+}
+
+/**
+ * Sanitize a path for use as a directory name.
+ * Mirrors Claude Code's sanitizePath() in sessionStoragePortable.ts:
+ *   - Replace all non-alphanumeric characters with hyphens
+ *   - If longer than MAX_SLUG_LENGTH, truncate and append a djb2 hash suffix
+ */
+function sanitizePath(name: string): string {
+	const sanitized = name.replace(/[^a-zA-Z0-9]/g, "-");
+	if (sanitized.length <= MAX_SLUG_LENGTH) {
+		return sanitized;
+	}
+	return `${sanitized.slice(0, MAX_SLUG_LENGTH)}-${djb2Hash(name)}`;
+}
+
 /**
  * Returns the memory directory for the current project.
- * Uses ~/.pi/agent/memory/<project-slug>/ so each project gets its own memory.
- * Falls back to a global directory when cwd is unavailable.
+ * Uses the canonical git root (so worktrees share memory with the main repo).
+ * Falls back to cwd when not in a git repo.
+ * Path layout mirrors Claude Code: ~/.pi/agent/memory/<sanitized-git-root>/
  */
 function getMemoryDir(cwd: string): string {
-	const slug = cwd
-		.replace(/^\//, "")
-		.replace(/\//g, "-")
-		.replace(/[^a-zA-Z0-9-_]/g, "_")
-		.slice(0, 64);
-	return join(homedir(), ".pi", "agent", "memory", slug || "global") + "/";
+	const base = findCanonicalGitRoot(cwd) ?? cwd;
+	const slug = sanitizePath(base) || "global";
+	return join(homedir(), ".pi", "agent", "memory", slug) + "/";
 }
 
 function ensureMemoryDir(dir: string): void {
@@ -89,153 +117,73 @@ function buildMemoryPrompt(memoryDir: string): string {
 		? truncateEntrypoint(entrypointContent)
 		: { content: `Your ${ENTRYPOINT_NAME} is currently empty. When you save new memories, they will appear here.` };
 
-	return `# auto memory
-
-You have a persistent, file-based memory system at \`${memoryDir}\`. This directory already exists — write to it directly with the Write tool (do not run mkdir or check for its existence).
-
-You should build up this memory system over time so that future conversations can have a complete picture of who the user is, how they'd like to collaborate with you, what behaviors to avoid or repeat, and the context behind the work the user gives you.
-
-If the user explicitly asks you to remember something, save it immediately as whichever type fits best. If they ask you to forget something, find and remove the relevant entry.
-
-## Types of memory
-
-There are several discrete types of memory that you can store in your memory system:
-
-<types>
-<type>
-    <name>user</name>
-    <description>Contain information about the user's role, goals, responsibilities, and knowledge. Great user memories help you tailor your future behavior to the user's preferences and perspective. Avoid writing memories about the user that could be viewed as a negative judgement or that are not relevant to the work you're trying to accomplish together.</description>
-    <when_to_save>When you learn any details about the user's role, preferences, responsibilities, or knowledge</when_to_save>
-    <how_to_use>When your work should be informed by the user's profile or perspective.</how_to_use>
-    <examples>
-    user: I'm a data scientist investigating what logging we have in place
-    assistant: [saves user memory: user is a data scientist, currently focused on observability/logging]
-
-    user: I've been writing Go for ten years but this is my first time touching the React side of this repo
-    assistant: [saves user memory: deep Go expertise, new to React and this project's frontend — frame frontend explanations in terms of backend analogues]
-    </examples>
-</type>
-<type>
-    <name>feedback</name>
-    <description>Guidance the user has given you about how to approach work — both what to avoid and what to keep doing. Record from failure AND success: if you only save corrections, you will avoid past mistakes but drift away from approaches the user has already validated, and may grow overly cautious.</description>
-    <when_to_save>Any time the user corrects your approach ("no not that", "don't", "stop doing X") OR confirms a non-obvious approach worked ("yes exactly", "perfect, keep doing that"). Include *why* so you can judge edge cases later.</when_to_save>
-    <how_to_use>Let these memories guide your behavior so that the user does not need to offer the same guidance twice.</how_to_use>
-    <body_structure>Lead with the rule itself, then a **Why:** line (the reason the user gave) and a **How to apply:** line (when/where this guidance kicks in).</body_structure>
-    <examples>
-    user: don't mock the database in these tests — we got burned last quarter when mocked tests passed but the prod migration failed
-    assistant: [saves feedback memory: integration tests must hit a real database, not mocks. Why: prior incident where mock/prod divergence masked a broken migration]
-
-    user: stop summarizing what you just did at the end of every response, I can read the diff
-    assistant: [saves feedback memory: this user wants terse responses with no trailing summaries]
-    </examples>
-</type>
-<type>
-    <name>project</name>
-    <description>Information that you learn about ongoing work, goals, initiatives, bugs, or incidents within the project that is not otherwise derivable from the code or git history.</description>
-    <when_to_save>When you learn who is doing what, why, or by when. Always convert relative dates to absolute dates when saving (e.g., "Thursday" → "2026-03-05").</when_to_save>
-    <how_to_use>Use these memories to more fully understand the details and nuance behind the user's request and make better informed suggestions.</how_to_use>
-    <body_structure>Lead with the fact or decision, then a **Why:** line and a **How to apply:** line.</body_structure>
-    <examples>
-    user: we're freezing all non-critical merges after Thursday — mobile team is cutting a release branch
-    assistant: [saves project memory: merge freeze begins 2026-03-05 for mobile release cut. Flag any non-critical PR work scheduled after that date]
-    </examples>
-</type>
-<type>
-    <name>reference</name>
-    <description>Stores pointers to where information can be found in external systems.</description>
-    <when_to_save>When you learn about resources in external systems and their purpose.</when_to_save>
-    <how_to_use>When the user references an external system or information that may be in an external system.</how_to_use>
-    <examples>
-    user: check the Linear project "INGEST" if you want context on these tickets, that's where we track all pipeline bugs
-    assistant: [saves reference memory: pipeline bugs are tracked in Linear project "INGEST"]
-    </examples>
-</type>
-</types>
-
-## What NOT to save in memory
-
-- Code patterns, conventions, architecture, file paths, or project structure — these can be derived by reading the current project state.
-- Git history, recent changes, or who-changed-what — \`git log\` / \`git blame\` are authoritative.
-- Debugging solutions or fix recipes — the fix is in the code; the commit message has the context.
-- Anything already documented in AGENTS.md / CLAUDE.md files.
-- Ephemeral task details: in-progress work, temporary state, current conversation context.
-
-These exclusions apply even when the user explicitly asks you to save. If they ask you to save a PR list or activity summary, ask what was *surprising* or *non-obvious* about it — that is the part worth keeping.
-
-## How to save memories
-
-Saving a memory is a two-step process:
-
-**Step 1** — write the memory to its own file (e.g., \`user_role.md\`, \`feedback_testing.md\`) using this frontmatter format:
-
-\`\`\`markdown
----
-name: {{memory name}}
-description: {{one-line description — used to decide relevance in future conversations, so be specific}}
-type: {{user, feedback, project, reference}}
----
-
-{{memory content — for feedback/project types, structure as: rule/fact, then **Why:** and **How to apply:** lines}}
-\`\`\`
-
-**Step 2** — add a pointer to that file in \`${ENTRYPOINT_NAME}\`. \`${ENTRYPOINT_NAME}\` is an index, not a memory — each entry should be one line, under ~150 characters: \`- [Title](file.md) — one-line hook\`. It has no frontmatter. Never write memory content directly into \`${ENTRYPOINT_NAME}\`.
-
-- \`${ENTRYPOINT_NAME}\` is always loaded into your conversation context — lines after ${MAX_ENTRYPOINT_LINES} will be truncated, so keep the index concise
-- Keep the name, description, and type fields in memory files up-to-date with the content
-- Organize memory semantically by topic, not chronologically
-- Update or remove memories that turn out to be wrong or outdated
-- Do not write duplicate memories. First check if there is an existing memory you can update before writing a new one.
-
-## When to access memories
-
-- When memories seem relevant, or the user references prior-conversation work.
-- You MUST access memory when the user explicitly asks you to check, recall, or remember.
-- If the user says to *ignore* or *not use* memory: Do not apply remembered facts, cite, compare against, or mention memory content.
-- Memory records can become stale over time. Before answering based on memory, verify that the memory is still correct by reading the current state of the files or resources. If a recalled memory conflicts with current information, trust what you observe now — and update or remove the stale memory.
-
-## Before recommending from memory
-
-A memory that names a specific function, file, or flag is a claim that it existed *when the memory was written*. It may have been renamed, removed, or never merged. Before recommending it:
-
-- If the memory names a file path: check the file exists.
-- If the memory names a function or flag: grep for it.
-- If the user is about to act on your recommendation, verify first.
-
-"The memory says X exists" is not the same as "X exists now."
-
-## Memory and other forms of persistence
-
-- When to use a plan instead of memory: For non-trivial implementation tasks, use a Plan to align with the user on approach. Plans are for current-session alignment; memory is for cross-session knowledge.
-- When to use tasks instead of memory: Use tasks to track in-progress work within the current conversation. Memory is reserved for information useful in future conversations.
-
-## ${ENTRYPOINT_NAME}
-
-${indexContent}`;
+	return buildMemorySystemPrompt({
+		memoryDir,
+		entrypointName: ENTRYPOINT_NAME,
+		maxEntrypointLines: MAX_ENTRYPOINT_LINES,
+		indexContent,
+	});
 }
 
 // ─── Extension entry point ────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
 	let memoryDir = "";
+	let cachedPrompt = "";
+	let cachedMtime = -1;
 
 	// Inject memory instructions into every agent turn's system prompt
 	pi.on("before_agent_start", async (event, ctx) => {
 		memoryDir = getMemoryDir(ctx.cwd);
 		ensureMemoryDir(memoryDir);
 
-		const memoryPrompt = buildMemoryPrompt(memoryDir);
+		// Only rebuild the memory prompt when MEMORY.md has changed.
+		// Stable prompt content = stable prompt cache across turns in the same session.
+		const entrypointPath = join(memoryDir, ENTRYPOINT_NAME);
+		let mtime = -1;
+		try {
+			mtime = statSync(entrypointPath).mtimeMs;
+		} catch {
+			// File doesn't exist yet — mtime stays -1
+		}
+
+		if (!cachedPrompt || mtime !== cachedMtime) {
+			cachedPrompt = buildMemoryPrompt(memoryDir);
+			cachedMtime = mtime;
+		}
+
 		ctx.ui.setStatus("memory", "🧠");
 
-		// Return modified system prompt — runner chains multiple extension results
-		return { systemPrompt: event.systemPrompt + "\n\n" + memoryPrompt };
+		// Insert before "Current date:" so date/cwd remain last, as pi-mono expects.
+		// Falls back to appending if the marker isn't found (e.g. custom prompts).
+		const marker = "\nCurrent date:";
+		const idx = event.systemPrompt.indexOf(marker);
+		const modified =
+			idx >= 0
+				? event.systemPrompt.slice(0, idx) + "\n\n" + cachedPrompt + event.systemPrompt.slice(idx)
+				: event.systemPrompt + "\n\n" + cachedPrompt;
+
+		return { systemPrompt: modified };
 	});
 
-	// /memory command — view current memory index
+	// /memory command — view or manage memory
 	pi.registerCommand("memory", {
 		description: "View or manage memory",
 		getArgumentCompletions: (prefix) => {
-			const cmds = ["show", "clear", "dir"];
-			return cmds.filter((c) => c.startsWith(prefix)).map((c) => ({ value: c, label: c }));
+			const dir = getMemoryDir("");
+			const staticCmds = ["clear", "dir"];
+			// Offer topic files as completions for "show <file>"
+			let fileCmds: string[] = [];
+			try {
+				const entries = readdirSync(dir);
+				fileCmds = entries
+					.filter((f) => f.endsWith(".md") && f !== ENTRYPOINT_NAME)
+					.map((f) => `show ${f}`);
+			} catch {
+				// Directory doesn't exist yet
+			}
+			const all = ["show", ...staticCmds, ...fileCmds];
+			return all.filter((c) => c.startsWith(prefix)).map((c) => ({ value: c, label: c }));
 		},
 		handler: async (args, ctx) => {
 			const arg = args.trim();
@@ -252,7 +200,6 @@ export default function (pi: ExtensionAPI) {
 					`This will delete all memory files in:\n${dir}\n\nAre you sure?`,
 				);
 				if (!confirmed) return;
-				const { readdirSync, rmSync } = await import("node:fs");
 				try {
 					for (const f of readdirSync(dir)) {
 						rmSync(join(dir, f), { recursive: true });
@@ -261,6 +208,40 @@ export default function (pi: ExtensionAPI) {
 				} catch (e) {
 					ctx.ui.notify(`Failed to clear memory: ${e}`, "error");
 				}
+				return;
+			}
+
+			// /memory show [filename] — read a specific topic file, or pick from list
+			if (arg === "show" || arg.startsWith("show ")) {
+				const filename = arg.startsWith("show ") ? arg.slice(5).trim() : "";
+
+				if (!filename) {
+					// No filename — show selector
+					let files: string[] = [];
+					try {
+						files = readdirSync(dir).filter((f) => f.endsWith(".md") && f !== ENTRYPOINT_NAME);
+					} catch {
+						// Directory doesn't exist yet
+					}
+					if (files.length === 0) {
+						ctx.ui.notify("No topic files yet.", "info");
+						return;
+					}
+					const selected = await ctx.ui.select("Select a memory file", files);
+					if (!selected) return;
+					const content = readFileSync(join(dir, selected), "utf-8");
+					ctx.ui.notify(content || "(empty)", "info");
+					return;
+				}
+
+				// Filename provided directly
+				const filePath = join(dir, filename);
+				if (!existsSync(filePath)) {
+					ctx.ui.notify(`File not found: ${filename}`, "error");
+					return;
+				}
+				const content = readFileSync(filePath, "utf-8");
+				ctx.ui.notify(content || "(empty)", "info");
 				return;
 			}
 

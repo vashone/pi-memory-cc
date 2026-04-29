@@ -6,12 +6,19 @@
   "keywords": ["pi-package"],
   "license": "MIT",
   "pi": {
-    "extensions": ["./extensions"],
+    "extensions": ["./extensions/memory.ts"],
     "skills": ["./skills"]
+  },
+  "scripts": {
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "lru-cache": "^11.0.0"
   },
   "devDependencies": {
     "@mariozechner/pi-coding-agent": "latest",
     "@mariozechner/pi-ai": "latest",
-    "typescript": "^5.0.0"
+    "typescript": "^5.0.0",
+    "vitest": "^2.0.0"
   }
 }
