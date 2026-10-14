@@ -17,7 +17,7 @@
 
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { findCanonicalGitRoot, physicalPath } from "./git.js";
 import { buildMemorySystemPrompt } from "./prompts.js";
@@ -72,6 +72,21 @@ function getMemoryDir(cwd: string): string {
 	const base = findCanonicalGitRoot(cwd) ?? physicalPath(cwd);
 	const slug = sanitizePath(base) || "global";
 	return join(homedir(), ".pi", "agent", "memory", slug) + "/";
+}
+
+/** The topic files in a memory directory: every .md file except the index. */
+function listTopicFiles(dir: string): string[] {
+	try {
+		return readdirSync(dir).filter((f) => f.endsWith(".md") && f !== ENTRYPOINT_NAME);
+	} catch {
+		return []; // Directory doesn't exist yet
+	}
+}
+
+/** Whether `path` lies below `dir`, so reading it can't leave the directory. */
+function isInsideDir(dir: string, path: string): boolean {
+	const rel = relative(dir, path);
+	return rel !== "" && rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
 }
 
 function ensureMemoryDir(dir: string): void {
@@ -132,14 +147,21 @@ function buildMemoryPrompt(memoryDir: string): string {
 // ─── Extension entry point ────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
+	// The session's cwd, for /memory. Argument completion gets no context and pi
+	// never changes the process cwd, so capture it when the session starts.
+	let sessionCwd: string | undefined;
+
+	pi.on("session_start", async (_event, ctx) => {
+		sessionCwd = ctx.cwd;
+		ctx.ui.setStatus("memory", "🧠");
+	});
+
 	// Inject memory as its own system prompt section on every agent turn.
 	// pi diffs sections against the transcript, so an unchanged MEMORY.md adds
 	// nothing to the request and a changed one appends only this section.
 	pi.on("before_agent_start", async (event, ctx) => {
 		const memoryDir = getMemoryDir(ctx.cwd);
 		ensureMemoryDir(memoryDir);
-
-		ctx.ui.setStatus("memory", "🧠");
 
 		event.systemPromptOptions.sections.memory = buildMemoryPrompt(memoryDir);
 	});
@@ -148,24 +170,16 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("memory", {
 		description: "View or manage memory",
 		getArgumentCompletions: (prefix) => {
-			const dir = getMemoryDir("");
 			const staticCmds = ["clear", "dir"];
 			// Offer topic files as completions for "show <file>"
-			let fileCmds: string[] = [];
-			try {
-				const entries = readdirSync(dir);
-				fileCmds = entries
-					.filter((f) => f.endsWith(".md") && f !== ENTRYPOINT_NAME)
-					.map((f) => `show ${f}`);
-			} catch {
-				// Directory doesn't exist yet
-			}
+			const topicFiles = sessionCwd === undefined ? [] : listTopicFiles(getMemoryDir(sessionCwd));
+			const fileCmds = topicFiles.map((f) => `show ${f}`);
 			const all = ["show", ...staticCmds, ...fileCmds];
 			return all.filter((c) => c.startsWith(prefix)).map((c) => ({ value: c, label: c }));
 		},
 		handler: async (args, ctx) => {
 			const arg = args.trim();
-			const dir = getMemoryDir(ctx.cwd);
+			const dir = getMemoryDir(sessionCwd ?? ctx.cwd);
 
 			if (arg === "dir") {
 				ctx.ui.notify(dir, "info");
@@ -173,6 +187,10 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (arg === "clear") {
+				if (!existsSync(dir)) {
+					ctx.ui.notify("Nothing to clear.", "info");
+					return;
+				}
 				const confirmed = await ctx.ui.confirm(
 					"Clear memory",
 					`This will delete all memory files in:\n${dir}\n\nAre you sure?`,
@@ -195,12 +213,7 @@ export default function (pi: ExtensionAPI) {
 
 				if (!filename) {
 					// No filename — show selector
-					let files: string[] = [];
-					try {
-						files = readdirSync(dir).filter((f) => f.endsWith(".md") && f !== ENTRYPOINT_NAME);
-					} catch {
-						// Directory doesn't exist yet
-					}
+					const files = listTopicFiles(dir);
 					if (files.length === 0) {
 						ctx.ui.notify("No topic files yet.", "info");
 						return;
@@ -213,7 +226,11 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				// Filename provided directly
-				const filePath = join(dir, filename);
+				const filePath = resolve(dir, filename);
+				if (!isInsideDir(dir, filePath)) {
+					ctx.ui.notify(`Not in the memory directory: ${filename}`, "error");
+					return;
+				}
 				if (!existsSync(filePath)) {
 					ctx.ui.notify(`File not found: ${filename}`, "error");
 					return;

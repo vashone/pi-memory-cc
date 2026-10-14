@@ -1,5 +1,6 @@
 /**
- * Tests for the extension's system prompt injection and memory directory.
+ * Tests for the extension's system prompt injection, memory directory, and
+ * /memory command.
  *
  * Drives the extension through a minimal fake pi API (the system boundary)
  * against a real temp HOME, so memory files live on a real filesystem.
@@ -12,7 +13,10 @@ import type {
 	BeforeAgentStartEvent,
 	BeforeAgentStartEventResult,
 	ExtensionAPI,
+	ExtensionCommandContext,
 	ExtensionContext,
+	RegisteredCommand,
+	SessionStartEvent,
 } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import memoryExtension, { sanitizePath } from "../extensions/memory.js";
@@ -43,19 +47,51 @@ type BeforeAgentStartHandler = (
 	ctx: ExtensionContext,
 ) => Promise<BeforeAgentStartEventResult | void>;
 
-/** Load the extension into a fake pi that records the before_agent_start handler. */
+type SessionStartHandler = (event: SessionStartEvent, ctx: ExtensionContext) => Promise<void>;
+
+type MemoryCommand = Pick<RegisteredCommand, "getArgumentCompletions" | "handler">;
+
+/** Load the extension into a fake pi that records its event handlers and the /memory command. */
 function loadExtension() {
 	let onBeforeAgentStart: BeforeAgentStartHandler | undefined;
+	let onSessionStart: SessionStartHandler | undefined;
+	let memoryCommand: MemoryCommand | undefined;
 	const pi = {
-		on: (event: string, handler: BeforeAgentStartHandler) => {
+		on: (event: string, handler: BeforeAgentStartHandler & SessionStartHandler) => {
 			if (event === "before_agent_start") onBeforeAgentStart = handler;
+			if (event === "session_start") onSessionStart = handler;
 		},
-		registerCommand: () => {},
+		registerCommand: (name: string, command: MemoryCommand) => {
+			if (name === "memory") memoryCommand = command;
+		},
 	} as unknown as ExtensionAPI;
 	memoryExtension(pi);
 
+	/** Start a session in `cwd` the way pi does. */
+	async function startSession(cwd = project) {
+		const ctx = { cwd, ui: { setStatus: () => {} } } as unknown as ExtensionContext;
+		await onSessionStart!({ type: "session_start", reason: "startup" }, ctx);
+	}
+
+	/** The /memory argument completions pi offers for `prefix`. */
+	async function completeMemoryCommand(prefix: string): Promise<string[]> {
+		const items = await memoryCommand!.getArgumentCompletions!(prefix);
+		return (items ?? []).map((item) => item.value);
+	}
+
+	/** Run `/memory <args>`, confirming any prompt, and return the notifications it shows. */
+	async function runMemoryCommand(args: string) {
+		const notifications: { message: string; type?: string }[] = [];
+		const ui = {
+			notify: (message: string, type?: string) => notifications.push({ message, type }),
+			confirm: async () => true,
+		};
+		await memoryCommand!.handler(args, { cwd: project, ui } as unknown as ExtensionCommandContext);
+		return notifications;
+	}
+
 	/** Run one before_agent_start the way pi does, returning the handler result and the prompt sections. */
-	return async function startTurn(sections: Record<string, string> = {}, cwd = project) {
+	async function startTurn(sections: Record<string, string> = {}, cwd = project) {
 		const event = {
 			type: "before_agent_start",
 			messageType: "user",
@@ -63,10 +99,12 @@ function loadExtension() {
 			systemPrompt: "",
 			systemPromptOptions: { cwd, sections },
 		} as unknown as BeforeAgentStartEvent;
-		const ctx = { cwd, ui: { setStatus: () => {} } } as unknown as ExtensionContext;
+		const ctx = { cwd } as unknown as ExtensionContext;
 		const result = await onBeforeAgentStart!(event, ctx);
 		return { result, sections: event.systemPromptOptions.sections };
-	};
+	}
+
+	return { startSession, startTurn, completeMemoryCommand, runMemoryCommand };
 }
 
 /** ~/.pi/agent/memory/ under the temp HOME, which holds one directory per project. */
@@ -83,7 +121,7 @@ function memoryDir(): string {
 
 /** Run a turn from each cwd, then list the memory directories those turns created. */
 async function memoryDirsAfterTurnsIn(...cwds: string[]): Promise<string[]> {
-	const startTurn = loadExtension();
+	const { startTurn } = loadExtension();
 	for (const cwd of cwds) await startTurn({}, cwd);
 	return readdirSync(memoryRoot());
 }
@@ -100,7 +138,7 @@ function symlinkTo(target: string): string {
 
 describe("memory section injection", () => {
 	it("injects an empty-index notice as the memory section without forcing the system prompt", async () => {
-		const startTurn = loadExtension();
+		const { startTurn } = loadExtension();
 		const { result, sections } = await startTurn();
 
 		expect(result?.systemPrompt).toBeUndefined();
@@ -108,7 +146,7 @@ describe("memory section injection", () => {
 	});
 
 	it("injects the current MEMORY.md index on every turn", async () => {
-		const startTurn = loadExtension();
+		const { startTurn } = loadExtension();
 		await startTurn();
 		const index = join(memoryDir(), "MEMORY.md");
 
@@ -124,11 +162,48 @@ describe("memory section injection", () => {
 	});
 
 	it("keeps sections set by earlier extensions", async () => {
-		const startTurn = loadExtension();
+		const { startTurn } = loadExtension();
 		const { sections } = await startTurn({ todos: "- ship #1" });
 
 		expect(sections.todos).toBe("- ship #1");
 		expect(sections.memory).toBeDefined();
+	});
+});
+
+// ─── /memory command ─────────────────────────────────────────────────────────
+
+describe("/memory command", () => {
+	it("completes the topic files of the session's memory directory, not the process cwd's", async () => {
+		expect(process.cwd()).not.toBe(project);
+		const { startSession, startTurn, completeMemoryCommand } = loadExtension();
+		await startSession(project);
+		await startTurn();
+		for (const file of ["MEMORY.md", "user_role.md", "feedback_testing.md"]) {
+			writeFileSync(join(memoryDir(), file), "");
+		}
+
+		expect((await completeMemoryCommand("show ")).sort()).toEqual(["show feedback_testing.md", "show user_role.md"]);
+	});
+
+	it.each([
+		["a relative path", () => "../outside.md"],
+		["an absolute path", () => join(memoryRoot(), "outside.md")],
+	])("show reports an error for %s outside the memory directory and reads nothing", async (_kind, name) => {
+		const { startSession, startTurn, runMemoryCommand } = loadExtension();
+		await startSession();
+		await startTurn();
+		writeFileSync(join(memoryRoot(), "outside.md"), "another project's memory");
+
+		expect(await runMemoryCommand(`show ${name()}`)).toEqual([
+			{ message: expect.not.stringContaining("another project's memory"), type: "error" },
+		]);
+	});
+
+	it("clear reports there is nothing to clear when there is no memory directory", async () => {
+		const { startSession, runMemoryCommand } = loadExtension();
+		await startSession();
+
+		expect(await runMemoryCommand("clear")).toEqual([{ message: "Nothing to clear.", type: "info" }]);
 	});
 });
 
