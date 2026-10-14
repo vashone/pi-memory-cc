@@ -97,19 +97,31 @@ function ensureMemoryDir(dir: string): void {
 
 // ─── Entrypoint truncation ────────────────────────────────────────────────────
 
+/** Cut `text` to at most `maxBytes` UTF-8 bytes, at the last line boundary that fits. */
+function truncateToBytes(text: string, maxBytes: number): string {
+	const bytes = Buffer.from(text, "utf-8");
+	// A newline byte never occurs inside a multi-byte UTF-8 sequence.
+	let cutAt = bytes.lastIndexOf(0x0a, maxBytes);
+	if (cutAt <= 0) {
+		// No line fits: cut the first line, backing off continuation bytes so no character is split.
+		cutAt = maxBytes;
+		while (cutAt > 0 && (bytes[cutAt] & 0xc0) === 0x80) cutAt--;
+	}
+	return bytes.subarray(0, cutAt).toString("utf-8");
+}
+
 function truncateEntrypoint(raw: string): { content: string; truncated: boolean } {
 	const trimmed = raw.trim();
 	const lines = trimmed.split("\n");
 
-	if (lines.length <= MAX_ENTRYPOINT_LINES && trimmed.length <= MAX_ENTRYPOINT_BYTES) {
+	if (lines.length <= MAX_ENTRYPOINT_LINES && Buffer.byteLength(trimmed) <= MAX_ENTRYPOINT_BYTES) {
 		return { content: trimmed, truncated: false };
 	}
 
 	let truncated = lines.length > MAX_ENTRYPOINT_LINES ? lines.slice(0, MAX_ENTRYPOINT_LINES).join("\n") : trimmed;
 
-	if (truncated.length > MAX_ENTRYPOINT_BYTES) {
-		const cutAt = truncated.lastIndexOf("\n", MAX_ENTRYPOINT_BYTES);
-		truncated = truncated.slice(0, cutAt > 0 ? cutAt : MAX_ENTRYPOINT_BYTES);
+	if (Buffer.byteLength(truncated) > MAX_ENTRYPOINT_BYTES) {
+		truncated = truncateToBytes(truncated, MAX_ENTRYPOINT_BYTES);
 	}
 
 	return {
@@ -122,7 +134,7 @@ function truncateEntrypoint(raw: string): { content: string; truncated: boolean 
 
 // ─── System prompt injection ──────────────────────────────────────────────────
 
-function buildMemoryPrompt(memoryDir: string): string {
+function buildMemoryPrompt(memoryDir: string, hasWriteTool: boolean): string {
 	const entrypointPath = join(memoryDir, ENTRYPOINT_NAME);
 
 	let entrypointContent = "";
@@ -141,6 +153,7 @@ function buildMemoryPrompt(memoryDir: string): string {
 		entrypointName: ENTRYPOINT_NAME,
 		maxEntrypointLines: MAX_ENTRYPOINT_LINES,
 		indexContent,
+		hasWriteTool,
 	});
 }
 
@@ -163,7 +176,10 @@ export default function (pi: ExtensionAPI) {
 		const memoryDir = getMemoryDir(ctx.cwd);
 		ensureMemoryDir(memoryDir);
 
-		event.systemPromptOptions.sections.memory = buildMemoryPrompt(memoryDir);
+		// Name only tools the model can call: a hidden tool is active but has no declaration.
+		const { selectedTools, hiddenTools, sections } = event.systemPromptOptions;
+		const hasWriteTool = selectedTools.includes("write") && !hiddenTools.includes("write");
+		sections.memory = buildMemoryPrompt(memoryDir, hasWriteTool);
 	});
 
 	// /memory command — view or manage memory

@@ -6,8 +6,7 @@
   "keywords": ["pi-package"],
   "license": "MIT",
   "pi": {
-    "extensions": ["./extensions/memory.ts"],
-    "skills": ["./skills"]
+    "extensions": ["./extensions/memory.ts"]
   },
   "scripts": {
     "test": "vitest run",

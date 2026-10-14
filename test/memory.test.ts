@@ -15,6 +15,7 @@ import type {
 	ExtensionAPI,
 	ExtensionCommandContext,
 	ExtensionContext,
+	NormalizedBuildSystemPromptOptions,
 	RegisteredCommand,
 	SessionStartEvent,
 } from "@earendil-works/pi-coding-agent";
@@ -90,16 +91,26 @@ function loadExtension() {
 		return notifications;
 	}
 
-	/** Run one before_agent_start the way pi does, returning the handler result and the prompt sections. */
-	async function startTurn(sections: Record<string, string> = {}, cwd = project) {
+	/**
+	 * Run one before_agent_start the way pi does, returning the handler result and the prompt sections.
+	 * Prompt options default to pi's: the project cwd and the default tools, none hidden.
+	 */
+	async function startTurn(options: Partial<NormalizedBuildSystemPromptOptions> = {}) {
+		const systemPromptOptions = {
+			cwd: project,
+			sections: {},
+			selectedTools: ["read", "bash", "edit", "write"],
+			hiddenTools: [],
+			...options,
+		};
 		const event = {
 			type: "before_agent_start",
 			messageType: "user",
 			prompt: "hi",
 			systemPrompt: "",
-			systemPromptOptions: { cwd, sections },
+			systemPromptOptions,
 		} as unknown as BeforeAgentStartEvent;
-		const ctx = { cwd } as unknown as ExtensionContext;
+		const ctx = { cwd: systemPromptOptions.cwd } as unknown as ExtensionContext;
 		const result = await onBeforeAgentStart!(event, ctx);
 		return { result, sections: event.systemPromptOptions.sections };
 	}
@@ -122,7 +133,7 @@ function memoryDir(): string {
 /** Run a turn from each cwd, then list the memory directories those turns created. */
 async function memoryDirsAfterTurnsIn(...cwds: string[]): Promise<string[]> {
 	const { startTurn } = loadExtension();
-	for (const cwd of cwds) await startTurn({}, cwd);
+	for (const cwd of cwds) await startTurn({ cwd });
 	return readdirSync(memoryRoot());
 }
 
@@ -163,10 +174,74 @@ describe("memory section injection", () => {
 
 	it("keeps sections set by earlier extensions", async () => {
 		const { startTurn } = loadExtension();
-		const { sections } = await startTurn({ todos: "- ship #1" });
+		const { sections } = await startTurn({ sections: { todos: "- ship #1" } });
 
 		expect(sections.todos).toBe("- ship #1");
 		expect(sections.memory).toBeDefined();
+	});
+
+	it("tells the model to save with the write tool when it is active", async () => {
+		const { startTurn } = loadExtension();
+		const { sections } = await startTurn();
+
+		expect(sections.memory).toContain("with the write tool");
+	});
+
+	it.each([
+		["deactivated", { selectedTools: ["read", "bash", "edit"] }],
+		["hidden from the model", { hiddenTools: ["write"] }],
+	])("does not name the write tool when it is %s", async (_state, options) => {
+		const { startTurn } = loadExtension();
+		const { sections } = await startTurn(options);
+
+		expect(sections.memory).not.toContain("write tool");
+	});
+});
+
+// ─── MEMORY.md index caps ────────────────────────────────────────────────────
+
+const TRUNCATION_WARNING = "> WARNING: MEMORY.md was truncated.";
+
+/** `count` distinct index lines of `bytes` UTF-8 bytes each: a 3-digit number, a space, then 3-byte CJK characters. */
+function cjkIndexLines(count: number, bytes: number): string[] {
+	return Array.from({ length: count }, (_, i) => `${String(i).padStart(3, "0")} ${"記".repeat((bytes - 4) / 3)}`);
+}
+
+/** Write `lines` as the project's MEMORY.md, then return the memory section of the next turn. */
+async function memorySectionWithIndex(lines: string[]): Promise<string> {
+	const { startTurn } = loadExtension();
+	await startTurn();
+	writeFileSync(join(memoryDir(), "MEMORY.md"), `${lines.join("\n")}\n`);
+	const { sections } = await startTurn();
+	return sections.memory;
+}
+
+describe("MEMORY.md index caps", () => {
+	it("cuts a CJK index over 25,000 bytes at the last line boundary under the cap", async () => {
+		// 150 lines of 250 bytes: 37,649 bytes, but only 13,049 UTF-16 code units.
+		// 99 lines and their newlines take 24,848 bytes; 100 would take 25,099.
+		const lines = cjkIndexLines(150, 250);
+		const memory = await memorySectionWithIndex(lines);
+
+		expect(memory).toContain(`${lines.slice(0, 99).join("\n")}\n\n${TRUNCATION_WARNING}`);
+		expect(memory).not.toContain(lines[99]);
+	});
+
+	it("cuts an index over 200 lines to 200 lines", async () => {
+		const lines = cjkIndexLines(250, 40);
+		const memory = await memorySectionWithIndex(lines);
+
+		expect(memory).toContain(`${lines.slice(0, 200).join("\n")}\n\n${TRUNCATION_WARNING}`);
+		expect(memory).not.toContain(lines[200]);
+	});
+
+	it("passes an index within both caps through unchanged", async () => {
+		// 200 lines of 124 bytes: 24,999 bytes with their newlines.
+		const lines = cjkIndexLines(200, 124);
+		const memory = await memorySectionWithIndex(lines);
+
+		expect(memory).toContain(lines.join("\n"));
+		expect(memory).not.toContain(TRUNCATION_WARNING);
 	});
 });
 
