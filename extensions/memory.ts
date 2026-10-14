@@ -15,10 +15,10 @@
  *     reference_*.md
  */
 
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { findCanonicalGitRoot } from "./git.js";
 import { buildMemorySystemPrompt } from "./prompts.js";
 
@@ -128,42 +128,16 @@ function buildMemoryPrompt(memoryDir: string): string {
 // ─── Extension entry point ────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
-	let memoryDir = "";
-	let cachedPrompt = "";
-	let cachedMtime = -1;
-
-	// Inject memory instructions into every agent turn's system prompt
+	// Inject memory as its own system prompt section on every agent turn.
+	// pi diffs sections against the transcript, so an unchanged MEMORY.md adds
+	// nothing to the request and a changed one appends only this section.
 	pi.on("before_agent_start", async (event, ctx) => {
-		memoryDir = getMemoryDir(ctx.cwd);
+		const memoryDir = getMemoryDir(ctx.cwd);
 		ensureMemoryDir(memoryDir);
-
-		// Only rebuild the memory prompt when MEMORY.md has changed.
-		// Stable prompt content = stable prompt cache across turns in the same session.
-		const entrypointPath = join(memoryDir, ENTRYPOINT_NAME);
-		let mtime = -1;
-		try {
-			mtime = statSync(entrypointPath).mtimeMs;
-		} catch {
-			// File doesn't exist yet — mtime stays -1
-		}
-
-		if (!cachedPrompt || mtime !== cachedMtime) {
-			cachedPrompt = buildMemoryPrompt(memoryDir);
-			cachedMtime = mtime;
-		}
 
 		ctx.ui.setStatus("memory", "🧠");
 
-		// Insert before "Current date:" so date/cwd remain last, as pi-mono expects.
-		// Falls back to appending if the marker isn't found (e.g. custom prompts).
-		const marker = "\nCurrent date:";
-		const idx = event.systemPrompt.indexOf(marker);
-		const modified =
-			idx >= 0
-				? event.systemPrompt.slice(0, idx) + "\n\n" + cachedPrompt + event.systemPrompt.slice(idx)
-				: event.systemPrompt + "\n\n" + cachedPrompt;
-
-		return { systemPrompt: modified };
+		event.systemPromptOptions.sections.memory = buildMemoryPrompt(memoryDir);
 	});
 
 	// /memory command — view or manage memory

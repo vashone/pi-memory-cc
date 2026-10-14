@@ -10,14 +10,18 @@
     "skills": ["./skills"]
   },
   "scripts": {
-    "test": "vitest run"
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "lru-cache": "^11.0.0"
   },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
   "devDependencies": {
-    "@mariozechner/pi-coding-agent": "latest",
-    "@mariozechner/pi-ai": "latest",
+    "@earendil-works/pi-coding-agent": "^1.1.0",
+    "@types/node": "^26.0.0",
     "typescript": "^5.0.0",
     "vitest": "^2.0.0"
   }

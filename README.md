@@ -1,6 +1,6 @@
 # pi-memory-cc
 
-Claude Code-style auto memory extension for [pi-agent](https://github.com/badlogic/pi-mono).
+Claude Code-style auto memory extension for [pi](https://github.com/earendil-works/pi).
 
 The LLM proactively writes and maintains memory files **during conversation** — no post-session extraction, no extra LLM calls.
 
@@ -8,10 +8,10 @@ The LLM proactively writes and maintains memory files **during conversation** �
 
 On every `before_agent_start` event, the extension:
 1. Resolves the memory directory from the canonical git root (worktrees share memory with the main repo)
-2. Injects a full memory instruction set into the system prompt (four-type taxonomy, save/access rules, anti-drift guidance)
-3. Loads the current `MEMORY.md` index into context
+2. Builds the memory instruction set (four-type taxonomy, save/access rules, anti-drift guidance) with the current `MEMORY.md` index
+3. Sets it as the `memory` section of pi's structured system prompt
 
-The LLM then decides what to remember and writes files directly using the Write tool. The system prompt is rebuilt only when `MEMORY.md` changes (mtime-based cache), keeping the prompt cache stable across turns.
+The LLM then decides what to remember and writes memory files directly. pi diffs prompt sections against what the model has already seen, so turns where `MEMORY.md` hasn't changed add nothing to the request, and a change appends only the updated `memory` section. Requires pi 1.1 or later.
 
 ## Memory layout
 
@@ -55,6 +55,12 @@ Verify installation:
 pi list
 ```
 
+When working on this repo, load the working copy for a single run instead of installing it:
+
+```bash
+pi -e .
+```
+
 ## Commands
 
 | Command | Description |
@@ -92,6 +98,6 @@ The memory strategy is intentionally aligned with [Claude Code](https://github.c
 - **Two-step save protocol** — write topic file first, then update `MEMORY.md` index
 - **Git root as project key** — canonical git root resolution including worktree support and security validation, so all worktrees of the same repo share one memory directory
 - **Path sanitization** — same algorithm as Claude Code (`/[^a-zA-Z0-9]/g → '-'`, djb2 hash suffix when path exceeds 200 characters)
-- **Prompt cache stability** — system prompt is rebuilt only when `MEMORY.md` changes (mtime-based), keeping the prompt cache hit rate high within a session
+- **Prompt cache stability** — memory lives in its own system prompt section, so a memory write never rewrites the rest of the prompt
 
-The main structural difference is that Claude Code splits the system prompt into a static block (cached globally across sessions) and a dynamic block (memory + env info, not cached). pi-agent's API accepts a single string for the system prompt, so both parts are combined into one block with `cache_control: ephemeral` (session-scoped cache). In practice the cost impact is negligible given how infrequently memory is written per session.
+The main structural difference is that Claude Code splits the system prompt into a static block (cached globally across sessions) and a dynamic block (memory + env info, not cached). pi instead builds the system prompt from named sections and appends only changed sections to the transcript; memory is one of those sections.

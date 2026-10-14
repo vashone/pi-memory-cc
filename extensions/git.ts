@@ -10,8 +10,9 @@ import { readFileSync, realpathSync, statSync } from "node:fs";
 import { dirname, join, resolve, sep } from "node:path";
 import { LRUCache } from "lru-cache";
 
-const gitRootCache = new LRUCache<string, string | null>({ max: 50 });
-const canonicalRootCache = new LRUCache<string, string | null>({ max: 50 });
+// lru-cache values must be non-null, so `false` stands in for "no git root".
+const gitRootCache = new LRUCache<string, string | false>({ max: 50 });
+const canonicalRootCache = new LRUCache<string, string>({ max: 50 });
 
 /**
  * Walk up the directory tree looking for a .git directory or file.
@@ -21,7 +22,7 @@ const canonicalRootCache = new LRUCache<string, string | null>({ max: 50 });
  */
 export function findGitRoot(startPath: string): string | null {
 	const cached = gitRootCache.get(startPath);
-	if (cached !== undefined) return cached;
+	if (cached !== undefined) return cached || null;
 
 	let current = resolve(startPath);
 	const root = current.substring(0, current.indexOf(sep) + 1) || sep;
@@ -52,7 +53,7 @@ export function findGitRoot(startPath: string): string | null {
 		} catch {}
 	}
 
-	gitRootCache.set(startPath, result);
+	gitRootCache.set(startPath, result ?? false);
 	return result;
 }
 
