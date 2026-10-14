@@ -13,9 +13,6 @@
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
   },
-  "dependencies": {
-    "lru-cache": "^11.0.0"
-  },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*"
   },

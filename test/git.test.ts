@@ -1,66 +1,47 @@
 /**
  * Tests for findGitRoot and findCanonicalGitRoot.
  *
- * Uses a temp directory to construct realistic filesystem fixtures:
+ * Uses a temp directory with real git checkouts (or fixtures that copy them,
+ * see git-fixtures.ts) plus hand-built layouts:
  *   - regular repo (.git is a directory)
- *   - worktree (.git is a file pointing to main repo)
+ *   - worktrees with absolute and relative paths (.git is a file pointing to main repo)
+ *   - security: a checkout whose worktree backlink points elsewhere
  *   - submodule (.git is a file but no commondir)
  *   - non-git directory
  *   - subdirectory inside a repo
  *   - security: malicious commondir pointer
  */
 
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { clearGitCaches, findCanonicalGitRoot, findGitRoot } from "../extensions/git.js";
+import { findCanonicalGitRoot, findGitRoot } from "../extensions/git.js";
+import { addWorktree, initRepo } from "./git-fixtures.js";
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 let tmp: string;
 
 beforeEach(() => {
-	tmp = mkdtempSync(join(tmpdir(), "pi-memory-git-test-"));
-	clearGitCaches();
+	// Physical path, like the paths git records (tmpdir() is a symlink on macOS)
+	tmp = realpathSync(mkdtempSync(join(tmpdir(), "pi-memory-git-test-")));
 });
 
 afterEach(() => {
 	rmSync(tmp, { recursive: true, force: true });
 });
 
-function makeRepo(dir: string): string {
-	mkdirSync(join(dir, ".git"), { recursive: true });
-	// Minimal .git contents needed for worktree resolution
-	mkdirSync(join(dir, ".git", "worktrees"), { recursive: true });
-	return dir;
-}
-
-function makeWorktree(worktreeDir: string, mainRepo: string, name: string): string {
-	// Simulate what `git worktree add` creates:
-	// <worktreeDir>/.git  — file pointing to <mainRepo>/.git/worktrees/<name>
-	// <mainRepo>/.git/worktrees/<name>/gitdir  — back-link to <worktreeDir>/.git
-	// <mainRepo>/.git/worktrees/<name>/commondir — points to ../..  (i.e. <mainRepo>/.git)
-	const worktreeGitDir = join(mainRepo, ".git", "worktrees", name);
-	mkdirSync(worktreeGitDir, { recursive: true });
-
-	writeFileSync(join(worktreeDir, ".git"), `gitdir: ${worktreeGitDir}\n`);
-	writeFileSync(join(worktreeGitDir, "gitdir"), join(worktreeDir, ".git") + "\n");
-	writeFileSync(join(worktreeGitDir, "commondir"), "../..\n");
-
-	return worktreeDir;
-}
-
 // ─── findGitRoot ─────────────────────────────────────────────────────────────
 
 describe("findGitRoot", () => {
 	it("returns the repo root when .git is a directory", () => {
-		const repo = makeRepo(join(tmp, "repo"));
+		const repo = initRepo(join(tmp, "repo"));
 		expect(findGitRoot(repo)).toBe(repo);
 	});
 
 	it("finds root from a subdirectory", () => {
-		const repo = makeRepo(join(tmp, "repo"));
+		const repo = initRepo(join(tmp, "repo"));
 		const sub = join(repo, "src", "utils");
 		mkdirSync(sub, { recursive: true });
 		expect(findGitRoot(sub)).toBe(repo);
@@ -73,20 +54,10 @@ describe("findGitRoot", () => {
 	});
 
 	it("returns the worktree dir when .git is a file", () => {
-		const mainRepo = makeRepo(join(tmp, "main"));
-		const worktree = mkdirSync(join(tmp, "worktree"), { recursive: true }) && join(tmp, "worktree");
-		makeWorktree(worktree!, mainRepo, "fix");
+		const mainRepo = initRepo(join(tmp, "main"));
+		const worktree = addWorktree(mainRepo, join(tmp, "worktree"), "absolute");
 		// findGitRoot stops at the .git file — canonical resolution is findCanonicalGitRoot's job
-		expect(findGitRoot(worktree!)).toBe(worktree);
-	});
-
-	it("caches results — second call does not re-stat", () => {
-		const repo = makeRepo(join(tmp, "repo"));
-		const first = findGitRoot(repo);
-		// Delete .git to prove the second call uses cache
-		rmSync(join(repo, ".git"), { recursive: true });
-		const second = findGitRoot(repo);
-		expect(second).toBe(first);
+		expect(findGitRoot(worktree)).toBe(worktree);
 	});
 });
 
@@ -94,17 +65,29 @@ describe("findGitRoot", () => {
 
 describe("findCanonicalGitRoot", () => {
 	it("returns the repo root for a regular repo", () => {
-		const repo = makeRepo(join(tmp, "repo"));
+		const repo = initRepo(join(tmp, "repo"));
 		expect(findCanonicalGitRoot(repo)).toBe(repo);
 	});
 
-	it("returns the main repo root for a worktree", () => {
-		const mainRepo = makeRepo(join(tmp, "main"));
-		const worktree = join(tmp, "worktree");
-		mkdirSync(worktree);
-		makeWorktree(worktree, mainRepo, "fix");
-		expect(findCanonicalGitRoot(worktree)).toBe(mainRepo);
+	it("resolves the main working tree and its absolute- and relative-path worktrees to the main repo root", () => {
+		const mainRepo = initRepo(join(tmp, "main"));
+		const absolute = addWorktree(mainRepo, join(tmp, "wt-abs"), "absolute");
+		const relative = addWorktree(mainRepo, join(tmp, "wt-rel"), "relative");
+		expect([mainRepo, absolute, relative].map(findCanonicalGitRoot)).toEqual([mainRepo, mainRepo, mainRepo]);
 	});
+
+	it.each(["absolute", "relative"] as const)(
+		"keeps its own root when the worktree backlink points to another checkout (%s paths)",
+		(paths) => {
+			const mainRepo = initRepo(join(tmp, "main"));
+			const worktree = addWorktree(mainRepo, join(tmp, "worktree"), paths);
+			// A sibling claims the worktree's gitdir; that gitdir's backlink still names the worktree
+			const impostor = join(tmp, "impostor");
+			mkdirSync(impostor);
+			copyFileSync(join(worktree, ".git"), join(impostor, ".git"));
+			expect(findCanonicalGitRoot(impostor)).toBe(impostor);
+		},
+	);
 
 	it("returns null when not in a git repo", () => {
 		const dir = join(tmp, "no-git");
@@ -125,8 +108,8 @@ describe("findCanonicalGitRoot", () => {
 
 	it("security: rejects malicious commondir pointing outside worktrees/", () => {
 		// Attacker crafts a .git file + commondir pointing to a victim repo
-		const mainRepo = makeRepo(join(tmp, "main"));
-		const victim = makeRepo(join(tmp, "victim"));
+		initRepo(join(tmp, "main"));
+		const victim = initRepo(join(tmp, "victim"));
 		const malicious = join(tmp, "malicious");
 		mkdirSync(malicious);
 
@@ -139,26 +122,5 @@ describe("findCanonicalGitRoot", () => {
 
 		// Should fall back to malicious dir (gitRoot), not victim
 		expect(findCanonicalGitRoot(malicious)).toBe(malicious);
-	});
-
-	it("caches results — second call uses cache", () => {
-		const mainRepo = makeRepo(join(tmp, "main"));
-		const worktree = join(tmp, "worktree");
-		mkdirSync(worktree);
-		makeWorktree(worktree, mainRepo, "fix");
-
-		const first = findCanonicalGitRoot(worktree);
-		// Remove worktree .git file to prove cache is used
-		rmSync(join(worktree, ".git"));
-		clearGitCaches(); // clear findGitRoot cache only to force re-entry, but canonicalRoot is cached on gitRoot key
-		// Re-add .git so findGitRoot works, but corrupt commondir
-		writeFileSync(join(worktree, ".git"), `gitdir: ${join(mainRepo, ".git", "worktrees", "fix")}\n`);
-		writeFileSync(join(mainRepo, ".git", "worktrees", "fix", "commondir"), "CORRUPTED\n");
-
-		// canonicalRootCache still has the result keyed on mainRepo worktree gitRoot
-		// Re-run without clearing canonicalRootCache
-		clearGitCaches();
-		// After full cache clear, it re-reads — commondir is now corrupted → falls back to gitRoot
-		expect(findCanonicalGitRoot(worktree)).toBe(worktree);
 	});
 });

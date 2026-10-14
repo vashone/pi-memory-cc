@@ -8,23 +8,28 @@
 
 import { readFileSync, realpathSync, statSync } from "node:fs";
 import { dirname, join, resolve, sep } from "node:path";
-import { LRUCache } from "lru-cache";
 
-// lru-cache values must be non-null, so `false` stands in for "no git root".
-const gitRootCache = new LRUCache<string, string | false>({ max: 50 });
-const canonicalRootCache = new LRUCache<string, string>({ max: 50 });
+/**
+ * The physical path of `path` (symlinks resolved), the form git records and
+ * pi's CLI passes as cwd. Falls back to the resolved path if it doesn't exist.
+ */
+export function physicalPath(path: string): string {
+	try {
+		return realpathSync(path);
+	} catch {
+		return resolve(path);
+	}
+}
 
 /**
  * Walk up the directory tree looking for a .git directory or file.
  * Returns the directory containing .git, or null if not found.
+ * Walks the physical path, like git does, so a symlinked path finds the same
+ * root as its target.
  * Pure filesystem — does not require git to be installed.
- * Memoized with LRU (max 50) to avoid repeated stat calls per turn.
  */
 export function findGitRoot(startPath: string): string | null {
-	const cached = gitRootCache.get(startPath);
-	if (cached !== undefined) return cached || null;
-
-	let current = resolve(startPath);
+	let current = physicalPath(startPath);
 	const root = current.substring(0, current.indexOf(sep) + 1) || sep;
 	let result: string | null = null;
 
@@ -53,7 +58,6 @@ export function findGitRoot(startPath: string): string | null {
 		} catch {}
 	}
 
-	gitRootCache.set(startPath, result ?? false);
 	return result;
 }
 
@@ -70,14 +74,10 @@ export function findGitRoot(startPath: string): string | null {
  * crafted .git file or commondir pointer.
  *
  * Submodules (.git is a file but no commondir) fall through to gitRoot.
- * Memoized with LRU (max 50) keyed on gitRoot.
  */
 export function findCanonicalGitRoot(startPath: string): string | null {
 	const gitRoot = findGitRoot(startPath);
 	if (!gitRoot) return null;
-
-	const cached = canonicalRootCache.get(gitRoot);
-	if (cached !== undefined) return cached;
 
 	let result: string;
 	try {
@@ -94,8 +94,9 @@ export function findCanonicalGitRoot(startPath: string): string | null {
 			if (resolve(dirname(worktreeGitDir)) !== join(commonDir, "worktrees")) {
 				result = gitRoot;
 			} else {
+				// `git worktree add --relative-paths` writes the backlink relative to worktreeGitDir
 				const backlink = realpathSync(
-					readFileSync(join(worktreeGitDir, "gitdir"), "utf-8").trim(),
+					resolve(worktreeGitDir, readFileSync(join(worktreeGitDir, "gitdir"), "utf-8").trim()),
 				);
 				if (backlink !== join(realpathSync(gitRoot), ".git")) {
 					result = gitRoot;
@@ -111,12 +112,5 @@ export function findCanonicalGitRoot(startPath: string): string | null {
 		result = gitRoot;
 	}
 
-	canonicalRootCache.set(gitRoot, result);
 	return result;
-}
-
-/** Exposed for tests — clear both caches. */
-export function clearGitCaches(): void {
-	gitRootCache.clear();
-	canonicalRootCache.clear();
 }

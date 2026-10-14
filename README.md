@@ -24,7 +24,9 @@ The LLM then decides what to remember and writes memory files directly. pi diffs
 └── reference_*.md     ← pointers to external systems
 ```
 
-The directory slug is derived from the canonical git root path: all non-alphanumeric characters replaced with `-`, truncated to 200 characters with a djb2 hash suffix if longer.
+The directory slug is derived from the physical path (symlinks resolved) of the canonical git root, or of the working directory outside a git repo: all non-alphanumeric characters replaced with `-`, truncated to 200 characters with a hash suffix if longer. The main working tree and all of its worktrees, including ones created with `git worktree add --relative-paths`, share one directory.
+
+Memory directories created by the initial version (215724a), which were named after the working directory with `_` substitution and a 64-character limit, are not migrated. To keep that memory, move its files into the directory shown by `/memory dir`.
 
 ## Memory types
 
@@ -97,7 +99,7 @@ The memory strategy is intentionally aligned with [Claude Code](https://github.c
 - **MEMORY.md as index** — same 200-line / 25KB dual cap with truncation warning; topic files are unlimited
 - **Two-step save protocol** — write topic file first, then update `MEMORY.md` index
 - **Git root as project key** — canonical git root resolution including worktree support and security validation, so all worktrees of the same repo share one memory directory
-- **Path sanitization** — same algorithm as Claude Code (`/[^a-zA-Z0-9]/g → '-'`, djb2 hash suffix when path exceeds 200 characters)
+- **Path sanitization** — same algorithm as Claude Code (`/[^a-zA-Z0-9]/g → '-'`, hash suffix when the path exceeds 200 characters)
 - **Prompt cache stability** — memory lives in its own system prompt section, so a memory write never rewrites the rest of the prompt
 
 The main structural difference is that Claude Code splits the system prompt into a static block (cached globally across sessions) and a dynamic block (memory + env info, not cached). pi instead builds the system prompt from named sections and appends only changed sections to the transcript; memory is one of those sections.

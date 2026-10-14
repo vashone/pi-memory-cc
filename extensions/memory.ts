@@ -19,7 +19,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync } from "node:f
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { findCanonicalGitRoot } from "./git.js";
+import { findCanonicalGitRoot, physicalPath } from "./git.js";
 import { buildMemorySystemPrompt } from "./prompts.js";
 
 // ─── Constants ───────────────────────────────────────────────────────────────
@@ -33,10 +33,13 @@ const MAX_ENTRYPOINT_BYTES = 25_000;
 const MAX_SLUG_LENGTH = 200;
 
 /**
- * djb2 hash — matches Claude Code's sessionStoragePortable.ts simpleHash.
+ * 32-bit `hash * 31 + c` string hash from 0 (Java's String.hashCode), as the
+ * base-36 absolute value. Not djb2 (`* 33` from 5381); existing memory
+ * directory names depend on this exact computation, so don't change it.
+ * Matches Claude Code's sessionStoragePortable.ts simpleHash.
  * Used as a suffix when the sanitized path exceeds MAX_SLUG_LENGTH.
  */
-function djb2Hash(str: string): string {
+function simpleHash(str: string): string {
 	let hash = 0;
 	for (let i = 0; i < str.length; i++) {
 		hash = ((hash << 5) - hash + str.charCodeAt(i)) | 0;
@@ -48,24 +51,25 @@ function djb2Hash(str: string): string {
  * Sanitize a path for use as a directory name.
  * Mirrors Claude Code's sanitizePath() in sessionStoragePortable.ts:
  *   - Replace all non-alphanumeric characters with hyphens
- *   - If longer than MAX_SLUG_LENGTH, truncate and append a djb2 hash suffix
+ *   - If longer than MAX_SLUG_LENGTH, truncate and append a hash of the full path
  */
-function sanitizePath(name: string): string {
+export function sanitizePath(name: string): string {
 	const sanitized = name.replace(/[^a-zA-Z0-9]/g, "-");
 	if (sanitized.length <= MAX_SLUG_LENGTH) {
 		return sanitized;
 	}
-	return `${sanitized.slice(0, MAX_SLUG_LENGTH)}-${djb2Hash(name)}`;
+	return `${sanitized.slice(0, MAX_SLUG_LENGTH)}-${simpleHash(name)}`;
 }
 
 /**
  * Returns the memory directory for the current project.
  * Uses the canonical git root (so worktrees share memory with the main repo).
  * Falls back to cwd when not in a git repo.
+ * Both are physical paths, so a symlinked cwd shares memory with its target.
  * Path layout mirrors Claude Code: ~/.pi/agent/memory/<sanitized-git-root>/
  */
 function getMemoryDir(cwd: string): string {
-	const base = findCanonicalGitRoot(cwd) ?? cwd;
+	const base = findCanonicalGitRoot(cwd) ?? physicalPath(cwd);
 	const slug = sanitizePath(base) || "global";
 	return join(homedir(), ".pi", "agent", "memory", slug) + "/";
 }
